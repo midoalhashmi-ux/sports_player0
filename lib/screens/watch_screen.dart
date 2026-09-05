@@ -20,6 +20,21 @@ import '../services/stream_models.dart';
 
 enum _LoadState { loading, error, ready }
 
+/// One authoritative state machine for a WebView -> Native detection session.
+/// It replaces the fragile combination of overlapping booleans/timers.
+enum _WebSessionState {
+  idle,
+  loadingPage,
+  webReady,
+  discovering,
+  candidateTrial,
+  nativePlaying,
+  nativeFailed,
+  drmWebOnly,
+  webFallback,
+  stopped,
+}
+
 class WatchScreen extends StatefulWidget {
   final String? channelId;
   final String? externalUrl;
@@ -234,10 +249,49 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
   // ---------------------- web source ----------------------
   String? _webSourceOrigin;
   Timer? _webDetectorTimer;
-  bool _webSwitchingToNative = false;
+  _WebSessionState _webSessionState = _WebSessionState.idle;
+  int _webSessionGeneration = 0;
+  bool _webDetectionInFlight = false;
+  int _webNativeAttempts = 0;
+  static const int _webMaxNativeAttempts = 2;
+  DateTime? _webLastNativeTrialAt;
   final Set<String> _webSeenSources = <String>{};
+  final Set<String> _webFailedNativeSources = <String>{};
+  final Map<String, int> _webCandidateEvidence = <String, int>{};
+  final Map<String, String> _webCandidateLastReason = <String, String>{};
+  Map<String, String>? _webContextHeaders;
   bool _webDrmDetected = false;
   String? _webDrmSystem;
+
+  void _setWebSessionState(_WebSessionState next) {
+    if (_webSessionState == next) return;
+    _webSessionState = next;
+  }
+
+  bool _webSessionIsActive(int generation) =>
+      mounted && generation == _webSessionGeneration &&
+      _webSessionState != _WebSessionState.stopped;
+
+  String _normalizeCandidate(String url) {
+    final uri = Uri.tryParse(url.trim());
+    if (uri == null) return url.trim();
+    // Keep the full URL by default: query parameters can be security/signing
+    // material for live streams. Only normalize casing/fragment noise.
+    return uri.replace(fragment: '').toString();
+  }
+
+  bool _canTrialNative(String source) {
+    if (_webDrmDetected) return false;
+    if (_webNativeAttempts >= _webMaxNativeAttempts) return false;
+    if (_webFailedNativeSources.contains(source)) return false;
+    if (_webSessionState == _WebSessionState.candidateTrial ||
+        _webSessionState == _WebSessionState.nativePlaying) return false;
+    final last = _webLastNativeTrialAt;
+    if (last != null && DateTime.now().difference(last) < const Duration(seconds: 2)) {
+      return false;
+    }
+    return true;
+  }
 
   bool _isAllowedWebNavigation(String target) {
     final uri = Uri.tryParse(target);
@@ -355,7 +409,9 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
           if (!value || typeof value !== 'string') return;
           const v = value.trim();
           if (!/^https?:\/\//i.test(v)) return;
-          if (/\.(m3u8|mpd|mp4|m4v|webm|mov)(?:$|[?#])/i.test(v)) out.add(v);
+          const l = v.toLowerCase();
+          if (/\.(m3u8|mpd|mp4|m4v|webm|mov)(?:$|[?#])/i.test(v) ||
+              /(?:m3u8|manifest|playlist|master|stream|live|hls)(?:[?&=\/]|$)/i.test(l)) out.add(v);
         };
         document.querySelectorAll('video').forEach(v => {
           add(v.currentSrc); add(v.src);
@@ -425,51 +481,119 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _captureWebContext(WebViewController controller) async {
+    try {
+      final result = await controller.runJavaScriptReturningResult(r'''(() => JSON.stringify({
+        referer: document.referrer || location.href,
+        origin: location.origin || '',
+        cookie: document.cookie || '',
+        userAgent: navigator.userAgent || ''
+      }))();''');
+      if (result is! String) return;
+      var text = result;
+      if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
+        text = text.substring(1, text.length - 1).replaceAll(r'\"', '"').replaceAll(r'\\', r'\');
+      }
+      final data = jsonDecode(text);
+      if (data is! Map) return;
+      final headers = <String, String>{};
+      final ua = data['userAgent']?.toString() ?? '';
+      final referer = data['referer']?.toString() ?? '';
+      final origin = data['origin']?.toString() ?? '';
+      final cookie = data['cookie']?.toString() ?? '';
+      if (ua.isNotEmpty) headers['user-agent'] = ua;
+      if (referer.startsWith('http')) headers['referer'] = referer;
+      if (origin.startsWith('http')) headers['origin'] = origin;
+      if (cookie.isNotEmpty) headers['cookie'] = cookie;
+      if (mounted && headers.isNotEmpty) _webContextHeaders = headers;
+    } catch (_) {}
+  }
+
   Future<void> _autoDetectWebSource(WebViewController controller) async {
     _webDetectorTimer?.cancel();
+    final generation = _webSessionGeneration;
     var attempts = 0;
+    _setWebSessionState(_WebSessionState.discovering);
+
     _webDetectorTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
-      if (!mounted || _webSwitchingToNative || attempts++ >= 15) {
+      if (!_webSessionIsActive(generation) || attempts++ >= 15) {
+        timer.cancel();
+        if (_webSessionIsActive(generation) && _webSessionState == _WebSessionState.discovering) {
+          _setWebSessionState(_WebSessionState.webReady);
+        }
+        return;
+      }
+      // Single-flight guard: a slow HTTP validation must never overlap the next tick.
+      if (_webDetectionInFlight || _webSessionState == _WebSessionState.candidateTrial) return;
+      if (_webDrmDetected) {
+        _setWebSessionState(_WebSessionState.drmWebOnly);
         timer.cancel();
         return;
       }
-      if (_webDrmDetected) return;
-      final sources = await _detectPublicMediaSources(controller);
-      final ranked = sources
-          .where((source) => _scoreDetectedSource(source) >= 80)
-          .toList()
-        ..sort((a, b) => _scoreDetectedSource(b).compareTo(_scoreDetectedSource(a)));
-
-      for (final source in ranked) {
-        if (!_webSeenSources.add(source)) continue;
-        final uri = Uri.tryParse(source);
-        if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) continue;
-        if (source.toLowerCase().contains('.mpd')) continue;
-
-        // لا ننقل المستخدم إلى Native Player لمجرد وجود امتداد m3u8/mp4.
-        // نتحقق أولاً أن المصدر نفسه حي وأنه فعلاً HLS/فيديو.
-        if (!await _validatePublicMediaSource(source)) continue;
-        if (!mounted || _webSwitchingToNative) return;
-
-        _webSwitchingToNative = true;
+      if (_webNativeAttempts >= _webMaxNativeAttempts) {
+        _setWebSessionState(_WebSessionState.webReady);
         timer.cancel();
-        final quality = StreamQuality(label: 'المصدر المكتشف تلقائياً', url: source);
-        await _playServerQuality(
-          StreamServerOption(label: 'المصدر المكتشف تلقائياً', qualities: [quality]),
-          quality,
-          fallbackToWeb: true,
-        );
         return;
+      }
+
+      _webDetectionInFlight = true;
+      try {
+        final sources = await _detectPublicMediaSources(controller);
+        if (!_webSessionIsActive(generation)) return;
+
+        for (final sourceRaw in sources) {
+          final source = _normalizeCandidate(sourceRaw);
+          final score = _scoreDetectedSource(source);
+          _webCandidateEvidence[source] = (_webCandidateEvidence[source] ?? 0) + 1;
+          if (score < 80) continue;
+          final uri = Uri.tryParse(source);
+          if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) continue;
+          if (source.toLowerCase().contains('.mpd')) continue;
+          if (!_canTrialNative(source)) continue;
+
+          // Candidate must be observed more than once OR have a strong HLS signature.
+          // This prevents jumping to a transient tracking/segment URL.
+          final evidence = _webCandidateEvidence[source] ?? 0;
+          final strongHls = _looksLikeHls(source) && score >= 100;
+          if (evidence < 2 && !strongHls) continue;
+
+          _setWebSessionState(_WebSessionState.candidateTrial);
+          _webNativeAttempts++;
+          _webLastNativeTrialAt = DateTime.now();
+          _webSeenSources.add(source);
+          _webCandidateLastReason[source] = 'validated candidate, evidence=$evidence, score=$score';
+          timer.cancel();
+
+          final quality = StreamQuality(label: 'المصدر المكتشف تلقائياً', url: source);
+          await _playServerQuality(
+            StreamServerOption(label: 'المصدر المكتشف تلقائياً', qualities: [quality]),
+            quality,
+            fallbackToWeb: true,
+          );
+          return;
+        }
+      } finally {
+        _webDetectionInFlight = false;
       }
     });
   }
 
+
   Future<void> _openWebSource(String url) async {
+    _webDetectorTimer?.cancel();
+    _webSessionGeneration++;
+    _webSessionState = _WebSessionState.loadingPage;
+    _webDetectionInFlight = false;
+    _webNativeAttempts = 0;
+    _webLastNativeTrialAt = null;
+    _webSeenSources.clear();
+    _webFailedNativeSources.clear();
+    _webCandidateEvidence.clear();
+    _webCandidateLastReason.clear();
     setState(() {
       _state = _LoadState.loading;
       _isWebSource = true;
-      _webSwitchingToNative = false;
-      _webSeenSources.clear();
+      _webContextHeaders = null;
       _webDrmDetected = false;
       _webDrmSystem = null;
     });
@@ -491,7 +615,8 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
                   _webDrmDetected = true;
                   _webDrmSystem = decoded['system']?.toString();
                 });
-                _webSwitchingToNative = false;
+                _webDetectorTimer?.cancel();
+                _setWebSessionState(_WebSessionState.drmWebOnly);
               }
             } catch (_) {}
           },
@@ -505,12 +630,16 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
           },
           onPageFinished: (_) async {
             await _installWebProtection(controller);
-            if (!mounted || _webSwitchingToNative) return;
+            await _captureWebContext(controller);
+            if (!mounted) return;
             setState(() => _state = _LoadState.ready);
-            unawaited(_autoDetectWebSource(controller));
+            if (!_webDrmDetected) {
+              _setWebSessionState(_WebSessionState.webReady);
+              unawaited(_autoDetectWebSource(controller));
+            }
           },
           onWebResourceError: (error) {
-            if (mounted && error.isForMainFrame == true && !_webSwitchingToNative) {
+            if (mounted && error.isForMainFrame == true && _webSessionState != _WebSessionState.candidateTrial && _webSessionState != _WebSessionState.nativePlaying) {
               setState(() {
                 _state = _LoadState.error;
                 _errorMessage = 'تعذر فتح صفحة البث. تحقق من الرابط والاتصال بالإنترنت ثم حاول مرة أخرى.';
@@ -522,7 +651,7 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       _webController = controller;
       setState(() => _state = _LoadState.ready);
-      unawaited(_autoDetectWebSource(controller));
+      // onPageFinished هو نقطة بدء الكشف الوحيدة. لا نطلق Timer ثانيًا هنا.
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -533,8 +662,24 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
   }
 
   // ---------------------- play ----------------------
+  Future<void> _proveNativePlayback(VideoPlayerController controller) async {
+    final start = controller.value.position;
+    await Future<void>.delayed(const Duration(milliseconds: 1400));
+    if (!controller.value.isInitialized) {
+      throw StateError('Native player did not remain initialized.');
+    }
+    final value = controller.value;
+    final advanced = value.position > start || value.position.inMilliseconds > 300;
+    if (!value.isPlaying || value.hasError || !advanced) {
+      throw StateError('Native playback proof failed.');
+    }
+  }
+
   Future<void> _playServerQuality(
       StreamServerOption server, StreamQuality quality, {bool fallbackToWeb = false}) async {
+    if (fallbackToWeb) {
+      _setWebSessionState(_WebSessionState.candidateTrial);
+    }
     setState(() {
       _state = _LoadState.loading;
       _isWebSource = false;
@@ -548,7 +693,10 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
 
       final newController = VideoPlayerController.networkUrl(
         Uri.parse(quality.url),
-        httpHeaders: _headers ?? const {},
+        httpHeaders: {
+          ...?_headers,
+          ...?_webContextHeaders,
+        },
       );
       _controller = newController;
       newController.addListener(_videoListener);
@@ -556,20 +704,47 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
       await newController.setPlaybackSpeed(_playbackSpeed);
       await newController.setVolume(_muted ? 0 : _volume / 100);
       await newController.play();
+      if (fallbackToWeb) {
+        await _proveNativePlayback(newController);
+      }
       await WakelockPlus.enable();
       if (!mounted) return;
+      if (fallbackToWeb) _setWebSessionState(_WebSessionState.nativePlaying);
       setState(() => _state = _LoadState.ready);
     } catch (error) {
       if (!mounted) return;
       if (fallbackToWeb) {
-        _webSwitchingToNative = false;
+        final failedController = _controller;
+        _controller = null;
+        try {
+          await failedController?.dispose();
+        } catch (_) {}
+        final failedUrl = _normalizeCandidate(quality.url);
+        _webFailedNativeSources.add(failedUrl);
+        _webSeenSources.add(failedUrl);
+        _webCandidateLastReason[failedUrl] = 'native playback failed: ${_describePlaybackError(error)}';
+        _setWebSessionState(_WebSessionState.nativeFailed);
         setState(() {
           _isWebSource = true;
           _state = _LoadState.ready;
           _errorMessage = '';
         });
+        // Return to the already-working WebView. A new detector run is only
+        // allowed if the session still has budget and cannot reuse this URL.
         final web = _webController;
-        if (web != null) unawaited(_autoDetectWebSource(web));
+        if (web != null && _webNativeAttempts < _webMaxNativeAttempts && !_webDrmDetected) {
+          _setWebSessionState(_WebSessionState.webFallback);
+          Future<void>.delayed(const Duration(milliseconds: 1200), () {
+            if (mounted && _isWebSource && !_webDrmDetected &&
+                _webSessionState == _WebSessionState.webFallback) {
+              unawaited(_autoDetectWebSource(web));
+            }
+          });
+        } else {
+          _setWebSessionState(_webDrmDetected
+              ? _WebSessionState.drmWebOnly
+              : _WebSessionState.webReady);
+        }
         return;
       }
       setState(() {

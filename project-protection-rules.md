@@ -41,3 +41,7 @@
 
 > اعمل على مشروعي حسب الملف المرفق "قواعد حماية بنية المشروع". لا تعدّل أي ملف من قائمة الملفات المحمية، ولا ترقّي أي حزمة موجودة، ولا تغيّر إعدادات البناء أو التوقيع أو معرّف التطبيق، إلا إذا طلبت ذلك صراحة أنا بنفسي. أي تعديل يحتاج يمس هذي المناطق، أوقف واشرح لي السبب قبل ما تسلّمني أي ملف. سلّمني فقط الملفات الجديدة/المعدّلة مع ذكر مسارها الكامل.
 
+
+
+### Auto Source Engine V3 safety invariant
+Only public media URLs exposed by the page are considered. DRM detection forces WebView-only mode; no DRM keys or encrypted media are extracted or bypassed.

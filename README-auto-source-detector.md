@@ -26,3 +26,10 @@ The web-source path now uses additional public-source signals:
 - Candidate validation happens before switching to the native player.
 - If DRM is detected, the page stays in WebView rather than attempting native playback.
 - If a validated native source fails during playback, the player falls back to WebView automatically.
+
+
+## V3 Session State Machine
+
+The WebView auto-source engine now uses a single session state machine instead of overlapping boolean flags. States include `loadingPage`, `webReady`, `discovering`, `candidateTrial`, `nativePlaying`, `nativeFailed`, `drmWebOnly`, and `webFallback`.
+
+Safety gates include single-flight detection, per-session generation tokens, candidate evidence accumulation, native-attempt budget (2), failed-source quarantine, DRM WebView-only mode, and a real native playback proof before the hand-off is considered successful.
