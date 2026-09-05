@@ -26,6 +26,7 @@ enum _WebSessionState {
   idle,
   loadingPage,
   webReady,
+  interacting,
   discovering,
   candidateTrial,
   nativePlaying,
@@ -262,6 +263,9 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
   Map<String, String>? _webContextHeaders;
   bool _webDrmDetected = false;
   String? _webDrmSystem;
+  int _webInteractionAttempts = 0;
+  static const int _webMaxInteractionAttempts = 3;
+  DateTime? _webLastInteractionAt;
 
   void _setWebSessionState(_WebSessionState next) {
     if (_webSessionState == next) return;
@@ -509,6 +513,125 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
+  Future<bool> _webPlaybackSentinel(WebViewController controller) async {
+    try {
+      final first = await controller.runJavaScriptReturningResult(r'''(() => {
+        const v = document.querySelector('video');
+        if (!v) return JSON.stringify({playing:false,time:0});
+        return JSON.stringify({playing:!v.paused && v.readyState >= 2,time:v.currentTime || 0});
+      })();''');
+      final firstText = first is String ? first : first?.toString() ?? '';
+      if (!firstText.contains('\"playing\":true')) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      if (!mounted || _webDrmDetected) return false;
+      final second = await controller.runJavaScriptReturningResult(r'''(() => {
+        const v = document.querySelector('video');
+        if (!v) return JSON.stringify({playing:false,time:0});
+        return JSON.stringify({playing:!v.paused && v.readyState >= 2,time:v.currentTime || 0});
+      })();''');
+      final secondText = second is String ? second : second?.toString() ?? '';
+      return secondText.contains('\"playing\":true');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> _runSmartInteraction(WebViewController controller) async {
+    if (_webDrmDetected || _webInteractionAttempts >= _webMaxInteractionAttempts) {
+      return false;
+    }
+    final last = _webLastInteractionAt;
+    if (last != null && DateTime.now().difference(last) < const Duration(seconds: 2)) {
+      return false;
+    }
+    _webInteractionAttempts++;
+    _webLastInteractionAt = DateTime.now();
+    _setWebSessionState(_WebSessionState.interacting);
+
+    try {
+      final result = await controller.runJavaScriptReturningResult(r'''(() => {
+        const normalize = (s) => (s || '').toString().trim().replace(/\s+/g, ' ').toLowerCase();
+        const blockedText = /(login|sign[ -]?in|subscribe|subscription|purchase|buy|download|advert|ads|privacy|cookie|close|share|facebook|twitter|telegram|whatsapp)/i;
+        const playText = /(play|watch|live|watch live|start|start stream|watch now|تشغيل|مشاهدة|بث مباشر|مشاهدة مباشرة|ابدأ|ابدأ البث|شاهد الآن)/i;
+        const isVisible = (el) => {
+          if (!el || !el.isConnected) return false;
+          const r = el.getBoundingClientRect();
+          const st = getComputedStyle(el);
+          return r.width >= 24 && r.height >= 24 && r.bottom >= 0 && r.right >= 0 &&
+            r.top <= innerHeight && r.left <= innerWidth && st.display !== 'none' &&
+            st.visibility !== 'hidden' && st.opacity !== '0' && el.getAttribute('aria-hidden') !== 'true';
+        };
+        const enabled = (el) => !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+        const videoRect = (() => {
+          const v = document.querySelector('video');
+          return v ? v.getBoundingClientRect() : null;
+        })();
+        const distanceToVideo = (el) => {
+          if (!videoRect) return 0;
+          const r = el.getBoundingClientRect();
+          const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+          const vx = videoRect.left + videoRect.width / 2, vy = videoRect.top + videoRect.height / 2;
+          return Math.hypot(cx - vx, cy - vy);
+        };
+        const candidates = [];
+        const seen = new Set();
+        document.querySelectorAll('button,[role=\"button\"],a,[aria-label],[title],input[type=\"button\"],input[type=\"submit\"]').forEach((el) => {
+          if (!isVisible(el) || !enabled(el)) return;
+          const label = normalize([
+            el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText,
+            el.textContent, el.getAttribute('data-testid'), el.className
+          ].join(' '));
+          if (!label || blockedText.test(label) || !playText.test(label)) return;
+          const r = el.getBoundingClientRect();
+          let score = 0;
+          if (playText.test(label)) score += 35;
+          if (el.hasAttribute('aria-label')) score += 20;
+          if (el.hasAttribute('title')) score += 10;
+          if (videoRect) {
+            const vr = videoRect;
+            const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+            if (cx >= vr.left - 80 && cx <= vr.right + 80 && cy >= vr.top - 80 && cy <= vr.bottom + 80) score += 45;
+            if (distanceToVideo(el) < 250) score += 20;
+          }
+          if (/play|player|video|watch|live/.test(label)) score += 15;
+          if (/icon|control|btn|button/.test(label)) score += 5;
+          if (el.closest('[id*=\"ad\" i],[class*=\"ad\" i],[id*=\"popup\" i],[class*=\"popup\" i],[id*=\"overlay\" i]')) score -= 100;
+          const key = `${el.tagName}|${label}|${Math.round(r.left)}|${Math.round(r.top)}`;
+          if (!seen.has(key)) { seen.add(key); candidates.push({el, score, label}); }
+        });
+        candidates.sort((a,b) => b.score - a.score);
+        const best = candidates[0];
+        if (!best || best.score < 55) return JSON.stringify({clicked:false, reason:'no-safe-play-control'});
+        try {
+          best.el.scrollIntoView({block:'center', inline:'center', behavior:'instant'});
+          best.el.click();
+          return JSON.stringify({clicked:true, score:best.score, label:best.label.slice(0,160)});
+        } catch (e) {
+          return JSON.stringify({clicked:false, reason:'click-failed'});
+        }
+      })();''');
+      final text = result is String ? result : result?.toString() ?? '';
+      if (text.contains('clicked') && text.contains('true')) {
+        await Future<void>.delayed(const Duration(milliseconds: 1800));
+        if (!mounted || _webDrmDetected) return false;
+        final evidence = await controller.runJavaScriptReturningResult(r'''(() => {
+          const v = document.querySelector('video');
+          if (!v) return JSON.stringify({playing:false, src:''});
+          return JSON.stringify({playing:!v.paused && v.readyState >= 2, time:v.currentTime || 0, src:v.currentSrc || v.src || ''});
+        })();''');
+        final evidenceText = evidence is String ? evidence : evidence?.toString() ?? '';
+        return evidenceText.contains('\"playing\":true');
+      }
+      return false;
+    } catch (_) {
+      return false;
+    } finally {
+      if (mounted && _webSessionState == _WebSessionState.interacting) {
+        _setWebSessionState(_WebSessionState.webReady);
+      }
+    }
+  }
+
   Future<void> _autoDetectWebSource(WebViewController controller) async {
     _webDetectorTimer?.cancel();
     final generation = _webSessionGeneration;
@@ -538,8 +661,32 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
 
       _webDetectionInFlight = true;
       try {
+        // V4 Web Playback Sentinel: if WebView is already playing real media,
+        // preserve that success and never force an unnecessary Native switch.
+        if (await _webPlaybackSentinel(controller)) {
+          if (_webSessionIsActive(generation)) {
+            _setWebSessionState(_WebSessionState.webReady);
+            timer.cancel();
+            _webDetectorTimer = null;
+          }
+          return;
+        }
+
         final sources = await _detectPublicMediaSources(controller);
         if (!_webSessionIsActive(generation)) return;
+
+        // V4 Smart Interaction: some legitimate players expose no media URL
+        // until their real visible Play/Watch control is activated.
+        if (sources.isEmpty && _webInteractionAttempts < _webMaxInteractionAttempts) {
+          final interacted = await _runSmartInteraction(controller);
+          if (interacted) {
+            timer.cancel();
+            _webDetectorTimer = null;
+            _setWebSessionState(_WebSessionState.discovering);
+            unawaited(_autoDetectWebSource(controller));
+            return;
+          }
+        }
 
         for (final sourceRaw in sources) {
           final source = _normalizeCandidate(sourceRaw);
@@ -586,6 +733,8 @@ class _WatchScreenState extends State<WatchScreen> with WidgetsBindingObserver {
     _webDetectionInFlight = false;
     _webNativeAttempts = 0;
     _webLastNativeTrialAt = null;
+    _webInteractionAttempts = 0;
+    _webLastInteractionAt = null;
     _webSeenSources.clear();
     _webFailedNativeSources.clear();
     _webCandidateEvidence.clear();

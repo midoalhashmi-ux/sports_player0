@@ -2,18 +2,14 @@ workflows:
   android-workflow:
     name: BinSheikh player
     max_build_duration: 90
-
     environment:
       flutter: 3.27.0
       android_signing:
         - sports_player_release
-
     scripts:
       - name: جلب الحزم
         script: flutter pub get
-
-      - name: بناء APK
+      - name: بناء APK (للاختبار والتثبيت المباشر)
         script: flutter build apk --release
-
     artifacts:
       - build/**/outputs/**/*.apk
